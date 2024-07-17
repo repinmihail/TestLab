@@ -1,68 +1,66 @@
-import math
 import pandas as pd
 import numpy as np
 import datetime
 import seaborn as sns
-import matplotlib.pyplot as plt
 import functools
 import operator
 import warnings
-
-from numpy import floating, number, object_, ndarray, dtype
-from numpy._typing import _16Bit
-
 import visualization as viz
 
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from matplotlib import pyplot as plt
+from sklearn.preprocessing import StandardScaler
 from tqdm.notebook import tqdm
 from functools import reduce
 from scipy import stats
-from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
-from typing import List, Callable, Tuple, Union, Dict, Any
+from typing import List, Callable, Tuple, Union
 from dtaidistance import dtw
 from datetime import timedelta, datetime
-from src import plot_time_series
-
-
-
 warnings.filterwarnings("ignore")
 
 
-class ABEstimation:
+class ABCore:
 
-    def __init__(self, params_dict: dict = None) -> None:
+    def __init__(self, *, params_dict: dict):
         """
         Инициализация базовых атрибутов класса
         """
-        self.target_metric_list = params_dict["target_metric"]
+        self.target_metric = params_dict["target_metric"]
         self.id_field = params_dict["id_field"]
         self.time_series_field = params_dict["time_series_field"]
         self.number_of_neighbors = params_dict["number_of_neighbors"]
         self.test_units = params_dict["test_units"]
         self.alpha = params_dict["alpha"]
-        self.beta = params_dict["beta"]
         self.cuped_time = params_dict["cuped_time"]
-        self.start_of_test = params_dict["strat_of_test"]
+        self.start_of_test = params_dict["start_of_test"]
+        self.days_for_knn = params_dict["days_for_knn"]
+        self.days_for_validation = params_dict["days_for_validation"]
+        self.days_for_test = params_dict["days_for_test"]
+        self.n_iter_bootstrap = params_dict["n_iter_bootstrap"]
+        
+    def create_periods(self):
+        self.end_of_test = (
+            datetime.strptime(self.start_of_test, "%Y-%m-%d")
+            + timedelta(days=self.days_for_test)
+        ).strftime("%Y-%m-%d")
+        self.start_of_validation = (
+            datetime.strptime(self.start_of_test, "%Y-%m-%d")
+            + timedelta(days=-self.days_for_validation)
+        ).strftime("%Y-%m-%d")
+        self.start_of_knn = (
+            datetime.strptime(self.start_of_validation, "%Y-%m-%d")
+            + timedelta(days=-self.days_for_knn)
+        ).strftime("%Y-%m-%d")
+        print(f"Подбор групп: с {self.start_of_knn} по {self.start_of_validation}")
+        print(f"Валидация: с {self.start_of_validation} по {self.start_of_test}")
+        print(f"Тест: с {self.start_of_test} по {self.end_of_test}")
+        return
 
-    def _check_data(self, df: pd.DataFrame):
-        """
-        """
-        df_cols = df.columns
-        assert (
-                len(
-                    [i for i in self.target_metric_list if i in df_cols]
-                ) == len(self.target_metric_list)
-        )
-
-    def get_scaled_data(self, data: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    def get_scaled_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Метод для масштабирования данных. Используется StandardScaler
 
         Args:
             data (pd.DataFrame): датафрейм с датами, юнитами и метрикой
-            metric_name (str): наменование столбца с метрикой
 
         Raises:
             KeyError: В случае, если наименование столбца с метрикой указано
@@ -72,44 +70,37 @@ class ABEstimation:
             pd.DataFrame: исходный датафрейм + масштабированная метрика
         """
         try:
-            scaled_metric = StandardScaler().fit_transform(data[[metric_name]])
+            scaled_metric = StandardScaler().fit_transform(data[[self.target_metric]])
         except KeyError:
-            raise KeyError(f"Frame data does not contain the field with name {metric_name}")
-        data[f"scaled_{metric_name}"] = scaled_metric
+            raise KeyError(f"Frame data does not contain the field with name {self.target_metric}")
+        data[f"scaled_{self.target_metric}"] = scaled_metric
         return data
 
-    def get_vectors(
-            self, data: pd.DataFrame, metric_name: str, id_field_name: str
-    ) -> Tuple[dict, dict]:
+    def get_vectors(self, data: pd.DataFrame) -> Tuple[dict, dict]:
         """
         Преобразует метрику из датафрейма в векторный вид
 
         Args:
             data (pd.DataFrame): датафрейм c масштабированной метрикой
-            metric_name (str): наименование столбца с масштабированной метрикой
-            id_field_name (str): наименование столбца с юнитом
 
         Returns:
             Tuple[dict, dict]:
                 dict0 - словарь с наименованием юнита в ключе и вектором в значении
                 dict1 - словарь с индексом юнита в ключе и наименованием юнита в значении
         """
-        data_vec = data.groupby(id_field_name).agg({f"scaled_{metric_name}": list}).reset_index()
-        data_vec[f"{metric_name}_array"] = [np.array(i) for i in data_vec[f"scaled_{metric_name}"]]
-        keys = data_vec[id_field_name].tolist()
-        vals = data_vec[f"{metric_name}_array"].tolist()
+        data_vec = data.groupby(self.id_field).agg({f"scaled_{self.target_metric}": list}).reset_index()
+        data_vec[f"{self.target_metric}_array"] = [np.array(i) for i in data_vec[f"scaled_{self.target_metric}"]]
+        keys = data_vec[self.id_field].tolist()
+        vals = data_vec[f"{self.target_metric}_array"].tolist()
         return dict(zip(keys, vals)), dict(zip([i for i in range(0, len(keys))], keys))
 
-    def get_k_neighbours_default(
-            self, id: str, vectors: dict, number_of_neighbours: int, algorithm='auto'
-    ) -> dict:
+    def get_k_neighbors_default(self, vectors: dict, id: str, algorithm='auto') -> dict:
         """
         Возвращает k ближайших соседей для одного заданного юнита
 
         Args:
             id (str): идентификатор юнита
             vectors (dict): словарь с наименованием юнита в ключе и вектором метрики в значении
-            number_of_neighbours (int): количество ближайших соседей для поиска
             algorithm (str, optional): алгорит подбора соседей. Defaults to 'auto'.
 
         Returns:
@@ -118,7 +109,7 @@ class ABEstimation:
 
         def get_knn(vectors):
             vector_arrays = [list(i) for i in vectors.values()]
-            return NearestNeighbors(number_of_neighbours, algorithm=algorithm).fit(vector_arrays)
+            return NearestNeighbors(self.number_of_neighbors, algorithm=algorithm).fit(vector_arrays)
 
         def get_vector(vectors, id):
             return vectors[id].reshape(1, -1)
@@ -129,20 +120,20 @@ class ABEstimation:
 
         knn = get_knn(vectors)
         vector = get_vector(vectors, id)
-        dist, nb_indexes = knn.kneighbors(vector, number_of_neighbours, return_distance=True)
+        dist, nb_indexes = knn.kneighbors(vector, self.number_of_neighbors, return_distance=True)
         return_dist, return_nb_indexes = flatten_neighbour_list(dist, nb_indexes)
         return dict(zip(return_nb_indexes, return_dist))
 
-    def get_k_neighbours_dtw(
-            self, data_dict: dict, target_id: str, n_neighbors=1
-    ):
+    def get_k_neighbors_dtw(self, data_dict: dict, target_id: str) -> dict:
         """
-        Находит ближайших соседей по расстоянию DTW для заданного временного ряда.
+        Находит ближайших соседей по расстоянию DTW для заданного временного ряда
 
-        :param data_dict: словарь, где ключи — идентификаторы наблюдений, значения — вектора временных рядов.
-        :param target_id: идентификатор временного ряда, для которого ищутся соседи.
-        :param n_neighbors: количество ближайших соседей, которые нужно вернуть.
-        :return: словарь, где ключи — идентификаторы ближайших соседей, значения — расстояния DTW.
+        Args:
+            data_dict (dict): словарь, где ключи — идентификаторы наблюдений, значения — вектора временных рядов
+            target_id (str): идентификатор временного ряда, для которого ищутся соседи
+
+        Returns:
+            nearest_neighbors (dict): словарь, где ключи — идентификаторы ближайших соседей, значения — расстояния DTW
         """
         target_vector = data_dict[target_id]
         distances = {}
@@ -150,21 +141,16 @@ class ABEstimation:
             if key != target_id:
                 distances[key] = dtw.distance(vector, target_vector)
         sorted_distances = sorted(distances.items(), key=lambda item: item[1])
-        nearest_neighbors = dict(sorted_distances[:n_neighbors])
+        nearest_neighbors = dict(sorted_distances[:self.number_of_neighbors])
         return nearest_neighbors
 
-    def get_all_neighbours_eucl(
-            self, knn_vectors: dict, ids_dict: dict, test_units: List[str],
-            number_of_neighbours: int
-    ) -> dict:
+    def get_all_neighbors_eucl(self, knn_vectors: dict, ids_dict: dict) -> dict:
         """
         Возвращает словарь с ближайшими соседями для всех, поданных на вход юнитов
 
         Args:
             knn_vectors (dict): словарь с наименованием юнита в ключе и вектором в значении
             ids_dict (dict): словарь с индексом юнита в ключе и наименованием юнита в значении
-            test_units (List[str]): список юнитов из тестовой группы
-            number_of_neighbours (int): количество ближайших соседей
 
         Returns:
             dict: словарь с наменованием юнита в ключе и списком соседей в значении
@@ -172,90 +158,138 @@ class ABEstimation:
         result_ids = {
             i: [
                 ids_dict[j] for j in self.get_k_neighbours_default(
-                    i, knn_vectors, number_of_neighbours + 1
+                    i, knn_vectors, self.number_of_neighbors + 1
                 ) if ids_dict[j] != i
             ]
-            for i in test_units
+            for i in self.test_units
         }
         return result_ids
 
-    def get_all_neighbours_dtw(
-            self, knn_vectors: dict, number_of_neighbours: int, test_units: List[str]
-    ) -> dict:
+    def get_all_neighbors_dtw(self, knn_vectors: dict) -> dict:
         """
         Возвращает словарь с ближайшими соседями для всех, поданных на вход юнитов
 
         Args:
             knn_vectors (dict): словарь с наименованием юнита в ключе и вектором в значении
-            number_of_neighbours (int): количество ближайших соседей
-            test_units (List[str]): список юнитов из тестовой группы
+
+        Returns:
+            dict: словарь с наменованием юнита в ключе и списком соседей в значении
         """
         res = {
-            i: [j for j in self.get_k_neighbours_dtw(knn_vectors, i, number_of_neighbours)] for i in test_units
+            i: [
+                j for j in self.get_k_neighbors_dtw(knn_vectors, i)
+            ] for i in self.test_units
         }
         return res
 
-    def get_test_control_val_groups(self, neighbours_dict: dict) -> dict:
+    def get_test_control_groups(self, neighbors_dict: dict) -> dict:
         """
         Формирует словарь со списками тестовых и контрольных юнитов в значениях словаря
 
         Args:
-            neighbours_dict (dict): словарь с наменованием юнита в ключе и списком соседей в значении
+            neighbors_dict (dict): словарь с наменованием юнита в ключе и списком соседей в значении
 
         Returns:
             dict: итоговый словарь {test_units: [str], control_units: [str]}
         """
-        test_units = list(neighbours_dict.keys())
-        control_units = [[j for j in i if j not in test_units][0] for i in neighbours_dict.values()]
+        self.control_units = [[j for j in i if j not in self.test_units][0] for i in neighbors_dict.values()]
         return dict(
-            test_units=test_units,
-            control_units=control_units,
+            test_units=self.test_units,
+            control_units=self.control_units,
         )
 
-    def get_percentile_ci(self, bootstrap_stats: Union[List[float]], alpha: float = 0.05):
-        """Строит перцентильный доверительный интервал."""
-        left, right = np.quantile(bootstrap_stats, [alpha / 2, 1 - alpha / 2])
+    def get_percentile_ci(self, bootstrap_stats: Union[List[float]]):
+        """
+        Строит перцентильный доверительный интервал
+
+        Args:
+            bootstrap_stats (List[float]): бутстрапированная статистика
+
+        Returns:
+            Tuple[float, float]: границы доверительного интервала
+        """
+        left, right = np.quantile(bootstrap_stats, [self.alpha / 2, 1 - self.alpha / 2])
         return left, right
 
     def get_normal_ci(
-            self, bootstrap_stats: Union[np.array, List], pe: float, alpha: float = 0.05
+            self, bootstrap_stats: Union[np.array, List], pe: float
     ) -> Tuple[float, float]:
         """
         Строит нормальный доверительный интервал.
 
-        args:
-            bootstrap_stats - массив значений посчитанной метрики,
-            pe - точечная оценка (рассчитывается на исходных данных)
+        Args:
+            bootstrap_stats (Union[np.array, List]): массив значений посчитанной метрики
+            pe (float): точечная оценка (рассчитывается на исходных данных)
 
-        return:
-            left, right - левая и правая границы доверительного интервала
+        Returns:
+            Tuple[float, float]: границы доверительного интервала
         """
-        z = stats.norm.ppf(1 - alpha / 2)
+        z = stats.norm.ppf(1 - self.alpha / 2)
         se = np.std(bootstrap_stats)
         left, right = pe - z * se, pe + z * se
         return left, right
 
+    def prepare_data_for_bootstrap(self, data: pd.DataFrame, is_cuped: bool = False) -> dict:
+        """
+        Готовит массивы данных и размер бутстрап выборки для бутстрапа
+
+        Args:
+            data (pd.DataFrame): датафрейм с целевой метрикой
+
+        Returns:
+            dict: словарь с массивами и размером бутстрап выборки
+        """
+        if is_cuped:
+            cuped_metric = f"{self.target_metric}_cuped"
+            control_values = np.array(data[data[self.id_field].isin(self.control_units)][cuped_metric])
+            test_values = np.array(data[data[self.id_field].isin(self.test_units)][cuped_metric])
+        else:
+            control_values = np.array(data[data[self.id_field].isin(self.control_units)][self.target_metric])
+            test_values = np.array(data[data[self.id_field].isin(self.test_units)][self.target_metric])
+        assert len(control_values) == len(test_values)
+        n = len(control_values)
+        return dict(
+            control_values=control_values,
+            test_values=test_values,
+            n=n
+        )
+        
     def bootstrap(
             self,
-            control_group: np.array,
-            test_group: np.array,
+            data: pd.DataFrame,
             metric_func: Callable,
-            bootstrap_group_length: int,
             effect: int,
-            alpha: float = 0.05,
-            n_iter: int = 10_000,
+            is_cuped: bool = False,
             verbose: bool = False
-    ):
+    ) -> dict:
+        """
+        Бутстрап
+
+        Args:
+            data (pd.DataFrame): датафрейм с целевой метрикой
+            metric_func (Callable): статистика расчета целевой метрики
+            effect (int): искусственный эффект
+            verbose (bool, optional): печать вывода. Defaults to False.
+
+        Returns:
+            dict: словарь с рассчитанными параметрами
+        """
         def _help_function(func: Callable, group: np.ndarray) -> Callable:
             return func(group)
-        difference_aa = np.zeros(n_iter)
-        difference_ab = np.zeros(n_iter)
-        # p_value_aa_res_tt = np.zeros(n_iter)
-        # p_value_ab_res_tt = np.zeros(n_iter)
-        for i in range(n_iter):
-            random_values_control = np.random.choice(control_group, bootstrap_group_length, True)
-            random_values_test = np.random.choice(test_group, bootstrap_group_length, True)
-            random_values_test_with_eff = np.random.choice(test_group + effect, bootstrap_group_length, True)
+        
+        # Готовим данные
+        vals = self.prepare_data_for_bootstrap(data, is_cuped=is_cuped)
+        test_values = vals["test_values"]
+        control_values = vals["control_values"]
+        bootstrap_group_length = vals["n"]
+        
+        # Бутстрап
+        difference_aa = np.zeros(self.n_iter_bootstrap)
+        difference_ab = np.zeros(self.n_iter_bootstrap)
+        for i in tqdm(range(self.n_iter_bootstrap)):
+            random_values_control = np.random.choice(control_values, bootstrap_group_length, True)
+            random_values_test = np.random.choice(test_values, bootstrap_group_length, True)
+            random_values_test_with_eff = np.random.choice(test_values + effect, bootstrap_group_length, True)
 
             control_metric = _help_function(metric_func, random_values_control)
             test_metric = _help_function(metric_func, random_values_test)
@@ -265,18 +299,20 @@ class ABEstimation:
             difference_ab[i] = test_metric_with_eff - control_metric
         # Расчет точечных оценок
         point_estimation_aa = (
-                _help_function(metric_func, test_group) - _help_function(metric_func, control_group)
+                _help_function(metric_func, test_values)
+                - _help_function(metric_func, control_values)
         )
         point_estimation_ab = (
-                _help_function(metric_func, test_group + effect) - _help_function(metric_func, control_group)
+                _help_function(metric_func, test_values + effect)
+                - _help_function(metric_func, control_values)
         )
         # Считаем p-value
         adj_diffs_aa = difference_aa - point_estimation_aa
         adj_diffs_ab = difference_ab - point_estimation_ab
         false_positive_aa = np.sum(np.abs(adj_diffs_aa) >= np.abs(point_estimation_aa))
         false_positive_ab = np.sum(np.abs(adj_diffs_ab) >= np.abs(point_estimation_ab))
-        p_value_aa_boot = false_positive_aa / n_iter
-        p_value_ab_boot = false_positive_ab / n_iter
+        p_value_aa_boot = false_positive_aa / self.n_iter_bootstrap
+        p_value_ab_boot = false_positive_ab / self.n_iter_bootstrap
 
         # Расчет доверительных интервалов
         ci_aa = self.get_percentile_ci(difference_aa)
@@ -287,7 +323,7 @@ class ABEstimation:
             print("A/A тест")
             print(f'Значение метрики изменилось на: {point_estimation_aa:0.5f}')
             print(
-                f'{((1 - alpha) * 100)}% доверительный интервал: '
+                f'{((1 - self.alpha) * 100)}% доверительный интервал: '
                 f'({ci_aa[0]:0.5f}, {ci_aa[1]:0.5f})'
             )
             print(f'Отличия статистически значимые: {has_effect_aa}')
@@ -297,7 +333,7 @@ class ABEstimation:
             print("A/B тест")
             print(f'Значение метрики изменилось на: {point_estimation_ab:0.5f}')
             print(
-                f'{((1 - alpha) * 100)}% доверительный интервал: '
+                f'{((1 - self.alpha) * 100)}% доверительный интервал: '
                 f'({ci_ab[0]:0.5f}, {ci_ab[1]:0.5f})'
             )
             print(f'Отличия статистически значимые: {has_effect_ab}')
@@ -317,106 +353,113 @@ class ABEstimation:
 
     def _calculate_theta(self, *, y_prepilot: np.array, y_pilot: np.array) -> float:
         """
-        Вычисляем Theta.
+        Вычисляем Theta
 
-        args:
-            y_pilot - значения метрики во время пилота,
-            y_prepilot - значения ковариант (той же самой метрики) на препилоте
-        return:
-            theta - значение коэффициента тета
+        Args:
+            y_prepilot (np.array): значения метрики во время пилота
+            y_pilot (np.array): значения ковариант (той же самой метрики) на препилоте
+
+        Returns:
+            float: значение коэффициента тета
         """
         covariance = np.cov(y_prepilot.astype(float), y_pilot.astype(float))[0, 1]
         variance = np.var(y_prepilot)
         theta = covariance / variance
         return theta
 
-    def calculate_cuped_metric(
-            self, df_history, df_experiment, target_metric_name: str, id_field_name: str, theta: float = None
-    ) -> pd.DataFrame:
+    def calculate_cuped_metric(self, df_history: pd.DataFrame, df_experiment: pd.DataFrame) -> pd.DataFrame:
         """
-        Вычисляет коварианту и преобразованную метрику cuped.
+        Расчет CUPED метрики
 
-        args:
-            df - pd.DataFrame, датафрейм с данными по пользователям,
-            метрикам (нормализованной ключевой метрикой) и стратами с разметкой:
-                1) на контроль и пилот (A/B/C..., где A-контроль) - столбец group,
-                2) пред-экспериментальный и экспериментальный периоды
-                (pilot/prepilot) - столбец period,
-        return:
-            res - датафрейм
+        Args:
+            df_history (pd.DataFrame): таблица с данными предпилотными данными
+            df_experiment (pd.DataFrame): таблица с данными пилота
+            theta (float, optional): _description_. Defaults to None.
+
+        Returns:
+            pd.DataFrame: датафрейм с cuped метрикой
         """
-        if df_history is None:
-            raise (
-                'Для применения CUPED используются исторические или прогнозные данные. '
-                'Необходимо задать аргумент df_history.'
-            )
         prepilot_period = (
             df_history[df_history['period'] == 'history']
-            .sort_values(id_field_name)
+            .sort_values(self.sortmerge_list)
         )
         pilot_period = (
             df_experiment[df_experiment['period'] == 'pilot']
-            .sort_values(id_field_name)
+            .sort_values(self.sortmerge_list)
         )
-        if theta is None:
-            theta = self._calculate_theta(
-                y_prepilot=np.array(prepilot_period[target_metric_name]),
-                y_pilot=np.array(pilot_period[target_metric_name])
+        theta = self._calculate_theta(
+            y_prepilot=np.array(prepilot_period[self.target_metric]),
+            y_pilot=np.array(pilot_period[self.target_metric])
             )
         res = pd.merge(
             prepilot_period,
             pilot_period,
             how='inner',
-            on=id_field_name,
-            suffixes=("_prepilot", "_pilot")
+            on=self.sortmerge_list,
+            suffixes=["_prepilot", "_pilot"]
         )
-        # cols = list(prepilot_period.columns)
         print(f'Theta is: {theta}', )
-        res[f'{target_metric_name}_cuped'] = (
-                res[f"{target_metric_name}_pilot"] - theta * res[f'{target_metric_name}_prepilot']
+        res[f'{self.target_metric}_cuped'] = (
+            res[f"{self.target_metric}_pilot"] - theta * res[f'{self.target_metric}_prepilot']
         )
         return res
 
-    @staticmethod
-    def check_weekday_or_weekend(date):
+    def check_weekday(self, date: str) -> int:
+        """
+        Возвращает день недели
+
+        Args:
+            date (str): дата в формате %Y-%m-%d
+
+        Returns:
+            int: день недели
+        """
         given_date = datetime.strptime(date, '%Y-%m-%d')
         day_of_week = (given_date.weekday() + 1)
         return day_of_week
 
     def sort_merge_for_cuped(
-            self, pre_pilot_df: pd.DataFrame, pilot_df: pd.DataFrame, id_field: str, cuped_time: int
+        self,
+        pre_pilot_df: pd.DataFrame,
+        pilot_df: pd.DataFrame,
+        all_groups: dict
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
+        Формирование и сортировка датафрейма для cuped'a
 
+        Args:
+            pre_pilot_df (pd.DataFrame): данные предпилотного периода
+            pilot_df (pd.DataFrame): данные пилотного периода
+            all_groups (dict): все юниты теста
+
+        Returns:
+            Tuple[pd.DataFrame, pd.DataFrame]: данные для cuped'a
         """
-        pre_pilot_df["weekday"] = pre_pilot_df[self.time_series_field].apply(
-            lambda x: self.check_weekday_or_weekend(x))
-        pilot_df["weekday"] = pilot_df[self.time_series_field].apply(
-            lambda x: self.check_weekday_or_weekend(x))
-        dates_for_lin = sorted(list(set(pre_pilot_df[self.time_series_field].values)))[-cuped_time:]
-        print(len(dates_for_lin))
+        # Определяем день недели
+        pre_pilot_df["weekday"] = pre_pilot_df[self.time_series_field].apply(lambda x: self.check_weekday(x))
+        pilot_df["weekday"] = pilot_df[self.time_series_field].apply(lambda x: self.check_weekday(x))
+        # Все юниты в тесте и контроле
+        all_units = functools.reduce(operator.iconcat, all_groups.values(), [])
+        # Предпилотный период
+        dates_for_lin = sorted(list(set(pre_pilot_df[self.time_series_field].values)))[-self.cuped_time:]
         pre_pilot_df = pre_pilot_df[
-            pre_pilot_df[self.time_series_field].isin(dates_for_lin) &
-            pre_pilot_df[self.id_field].isin(set(pilot_df[self.id_field].values))
-            ]
-        print(pilot_df.shape, pre_pilot_df.shape)
-
+            pre_pilot_df[self.time_series_field].isin(dates_for_lin) & 
+            pre_pilot_df[self.id_field].isin(all_units)
+        ]    
         pilot_df_sort = pilot_df.sort_values([self.id_field, "weekday"])
         pre_pilot_df_sort = pre_pilot_df.sort_values([self.id_field, "weekday"])
-
         pilot_df_sort["row_number"] = [i for i in range(0, len(pilot_df_sort))]
         pre_pilot_df_sort["row_number"] = [i for i in range(0, len(pre_pilot_df_sort))]
-
         pilot_df_sort["period"] = "pilot"
         pre_pilot_df_sort["period"] = "history"
-        return pilot_df_sort, pre_pilot_df_sort
+        cols = [self.time_series_field, self.id_field, self.target_metric, "weekday", "row_number", "period"]
+        self.sortmerge_list = [self.id_field, "row_number"]
+        return pilot_df_sort[cols], pre_pilot_df_sort[cols]
 
     @staticmethod
     def multitest_correction(
             *, list_of_pvals: List, alpha: float = 0.05, method: str = 'holm', **kwargs
-    ) -> dict[str, list[Any] | list[
-        floating[_16Bit] | number[Any] | object_ | ndarray[Any, dtype[floating[_16Bit]]] | ndarray[
-            Any, dtype[Any]] | Any] | Any]:
+    ) -> dict:
         """
         Корректировка p-value для множественной проверки гипотез.
 
