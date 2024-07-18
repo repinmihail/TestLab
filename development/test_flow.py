@@ -182,17 +182,21 @@ class ABCore:
         }
         return res
 
-    def get_test_control_groups(self, neighbors_dict: dict) -> dict:
+    def get_test_control_groups(self, neighbors_dict: dict, adj_control: List[str] = None) -> dict:
         """
         Формирует словарь со списками тестовых и контрольных юнитов в значениях словаря
 
         Args:
             neighbors_dict (dict): словарь с наменованием юнита в ключе и списком соседей в значении
+            adj_control (List[str]): лист с юнитами контрольной группы, скорректированной вручную
 
         Returns:
             dict: итоговый словарь {test_units: [str], control_units: [str]}
         """
-        self.control_units = [[j for j in i if j not in self.test_units][0] for i in neighbors_dict.values()]
+        if not adj_control:
+            self.control_units = [[j for j in i if j not in self.test_units][0] for i in neighbors_dict.values()]
+        else:
+            self.control_units = adj_control
         return dict(
             test_units=self.test_units,
             control_units=self.control_units,
@@ -260,7 +264,8 @@ class ABCore:
             metric_func: Callable,
             effect: int,
             is_cuped: bool = False,
-            verbose: bool = False
+            directory_path: str = None,
+            test_id: str = None
     ) -> dict:
         """
         Бутстрап
@@ -269,7 +274,8 @@ class ABCore:
             data (pd.DataFrame): датафрейм с целевой метрикой
             metric_func (Callable): статистика расчета целевой метрики
             effect (int): искусственный эффект
-            verbose (bool, optional): печать вывода. Defaults to False.
+            directory_path (str): путь для сохранения рисунка
+            test_id (str): идентификатор теста
 
         Returns:
             dict: словарь с рассчитанными параметрами
@@ -319,37 +325,28 @@ class ABCore:
         ci_ab = self.get_percentile_ci(difference_ab)
         has_effect_aa = not (ci_aa[0] < 0 < ci_aa[1])
         has_effect_ab = not (ci_ab[0] < 0 < ci_ab[1])
-        if verbose:
-            print("A/A тест")
-            print(f'Значение метрики изменилось на: {point_estimation_aa:0.5f}')
-            print(
-                f'{((1 - self.alpha) * 100)}% доверительный интервал: '
-                f'({ci_aa[0]:0.5f}, {ci_aa[1]:0.5f})'
+        viz.plot_ci(
+            difference_aa, point_estimation_aa, ci_aa,
+            p_value_aa_boot, aa_test=True,
+            directory_path=directory_path,
+            test_id=test_id
+        )
+        viz.plot_ci(
+            difference_ab, point_estimation_ab, ci_ab,
+            p_value_ab_boot, aa_test=False,
+            directory_path=directory_path,
+            test_id=test_id
             )
-            print(f'Отличия статистически значимые: {has_effect_aa}')
-            print(f"p-value from bootstrap is: {p_value_aa_boot}")
-            viz.plot_ci(difference_aa, point_estimation_aa, ci_aa)
-            print("------------------")
-            print("A/B тест")
-            print(f'Значение метрики изменилось на: {point_estimation_ab:0.5f}')
-            print(
-                f'{((1 - self.alpha) * 100)}% доверительный интервал: '
-                f'({ci_ab[0]:0.5f}, {ci_ab[1]:0.5f})'
-            )
-            print(f'Отличия статистически значимые: {has_effect_ab}')
-            print(f"p-value from bootstrap is: {p_value_ab_boot}")
-            viz.plot_ci(difference_ab, point_estimation_ab, ci_ab)
-        else:
-            return dict(
-                aa_test=has_effect_aa,
-                ab_test=has_effect_ab,
-                pe_aa=point_estimation_aa,
-                pe_ab=point_estimation_ab,
-                ci_aa=ci_aa,
-                ci_ab=ci_ab,
-                p_value_aa_boot=p_value_aa_boot,
-                p_value_ab_boot=p_value_ab_boot
-            )
+        return dict(
+            aa_test=has_effect_aa,
+            ab_test=has_effect_ab,
+            pe_aa=point_estimation_aa,
+            pe_ab=point_estimation_ab,
+            ci_aa=ci_aa,
+            ci_ab=ci_ab,
+            p_value_aa_boot=p_value_aa_boot,
+            p_value_ab_boot=p_value_ab_boot
+        )
 
     def _calculate_theta(self, *, y_prepilot: np.array, y_pilot: np.array) -> float:
         """
