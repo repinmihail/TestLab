@@ -37,7 +37,7 @@ class ABCore:
         self.days_for_test = params_dict["days_for_test"]
         self.n_iter_bootstrap = params_dict["n_iter_bootstrap"]
         
-    def create_periods(self):
+    def create_periods(self, verbose: bool = False):
         self.end_of_test = (
             datetime.strptime(self.start_of_test, "%Y-%m-%d")
             + timedelta(days=self.days_for_test)
@@ -50,9 +50,10 @@ class ABCore:
             datetime.strptime(self.start_of_validation, "%Y-%m-%d")
             + timedelta(days=-self.days_for_knn)
         ).strftime("%Y-%m-%d")
-        print(f"Подбор групп: с {self.start_of_knn} по {self.start_of_validation}")
-        print(f"Валидация: с {self.start_of_validation} по {self.start_of_test}")
-        print(f"Тест: с {self.start_of_test} по {self.end_of_test}")
+        if verbose:
+            print(f"Подбор групп: с {self.start_of_knn} по {self.start_of_validation}")
+            print(f"Валидация: с {self.start_of_validation} по {self.start_of_test}")
+            print(f"Тест: с {self.start_of_test} по {self.end_of_test}")
         return
 
     def get_scaled_data(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -274,6 +275,7 @@ class ABCore:
             data (pd.DataFrame): датафрейм с целевой метрикой
             metric_func (Callable): статистика расчета целевой метрики
             effect (int): искусственный эффект
+            is_cuped (bool): если используется cuped
             directory_path (str): путь для сохранения рисунка
             test_id (str): идентификатор теста
 
@@ -292,7 +294,7 @@ class ABCore:
         # Бутстрап
         difference_aa = np.zeros(self.n_iter_bootstrap)
         difference_ab = np.zeros(self.n_iter_bootstrap)
-        for i in tqdm(range(self.n_iter_bootstrap)):
+        for i in range(self.n_iter_bootstrap):
             random_values_control = np.random.choice(control_values, bootstrap_group_length, True)
             random_values_test = np.random.choice(test_values, bootstrap_group_length, True)
             random_values_test_with_eff = np.random.choice(test_values + effect, bootstrap_group_length, True)
