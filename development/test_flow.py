@@ -11,6 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from tqdm.notebook import tqdm
 from functools import reduce
 from scipy import stats
+from statsmodels.stats.multitest import multipletests
 from sklearn.neighbors import NearestNeighbors
 from typing import List, Callable, Tuple, Union
 from dtaidistance import dtw
@@ -89,6 +90,7 @@ class ABCore:
                 dict0 - словарь с наименованием юнита в ключе и вектором в значении
                 dict1 - словарь с индексом юнита в ключе и наименованием юнита в значении
         """
+        data = data.sort_values(by=[self.id_field, self.time_series_field]) # Добавлено (Шилин К. 25.07.2024): Добавил сортировку
         data_vec = data.groupby(self.id_field).agg({f"scaled_{self.target_metric}": list}).reset_index()
         data_vec[f"{self.target_metric}_array"] = [np.array(i) for i in data_vec[f"scaled_{self.target_metric}"]]
         keys = data_vec[self.id_field].tolist()
@@ -110,7 +112,7 @@ class ABCore:
 
         def get_knn(vectors):
             vector_arrays = [list(i) for i in vectors.values()]
-            return NearestNeighbors(self.number_of_neighbors, algorithm=algorithm).fit(vector_arrays)
+            return NearestNeighbors(n_neighbors=self.number_of_neighbors + 1, algorithm=algorithm).fit(vector_arrays)
 
         def get_vector(vectors, id):
             return vectors[id].reshape(1, -1)
@@ -121,7 +123,7 @@ class ABCore:
 
         knn = get_knn(vectors)
         vector = get_vector(vectors, id)
-        dist, nb_indexes = knn.kneighbors(vector, self.number_of_neighbors, return_distance=True)
+        dist, nb_indexes = knn.kneighbors(vector, self.number_of_neighbors + 1, return_distance=True)
         return_dist, return_nb_indexes = flatten_neighbour_list(dist, nb_indexes)
         return dict(zip(return_nb_indexes, return_dist))
 
@@ -158,8 +160,8 @@ class ABCore:
         """
         result_ids = {
             i: [
-                ids_dict[j] for j in self.get_k_neighbours_default(
-                    i, knn_vectors, self.number_of_neighbors + 1
+                ids_dict[j] for j in self.get_k_neighbors_default(
+                    knn_vectors, i
                 ) if ids_dict[j] != i
             ]
             for i in self.test_units
@@ -350,7 +352,47 @@ class ABCore:
             p_value_ab_boot=p_value_ab_boot
         )
 
-    def _calculate_theta(self, *, y_prepilot: np.array, y_pilot: np.array) -> float:
+    def delta_method(
+        self, data: pd.DataFrame, column_for_grouped: list, is_sample: bool = False
+    ) -> dict:
+        """_summary_
+
+        Args:
+            data (pd.DataFrame): датафрейм с метрикой
+            column_for_grouped (list): поля для группировки (идентификатор)
+            is_sample (bool, optional): выборочная оценка. Defaults to False.
+
+        Returns:
+            dict: словарь с рассчитанными параметрами
+        """
+
+        delta_df = data.groupby(column_for_grouped).agg(
+            {self.target_metric: ['sum', 'count']}
+        )
+        n_users = len(delta_df)
+        delta_df.columns = ['_'.join(col).strip() for col in delta_df.columns.values]
+        array_x = delta_df[f'{self.target_metric}_sum'].values
+        array_y = delta_df[f'{self.target_metric}_count'].values
+        mean_x, mean_y = np.mean(array_x), np.mean(array_y)
+        var_x, var_y = np.var(array_x), np.var(array_y)
+        cov_xy = np.cov(array_x, array_y)[0, 1]
+        var_metric = (
+            var_x / mean_y ** 2
+            - 2 * (mean_x / mean_y ** 3) * cov_xy
+            + (mean_x ** 2 / mean_y ** 4) * var_y
+        )
+        if is_sample:
+            var_metric = var_metric / n_users
+        info_dict = {}
+        info_dict['mean_x, mean_y'] = [mean_x, mean_y]
+        info_dict['var_x, var_y'] = [var_x, var_y]
+        info_dict['cov_xy'] = cov_xy
+        info_dict['n_users'] = n_users
+        info_dict['var_metric'] = var_metric
+        info_dict['std_metric'] = np.sqrt(var_metric)
+        return info_dict
+
+    def _calculate_theta(self, *, prepilot_period: pd.DataFrame, pilot_period: pd.DataFrame, is_ratio=True) -> float:
         """
         Вычисляем Theta
 
@@ -361,8 +403,16 @@ class ABCore:
         Returns:
             float: значение коэффициента тета
         """
-        covariance = np.cov(y_prepilot.astype(float), y_pilot.astype(float))[0, 1]
-        variance = np.var(y_prepilot)
+        
+        self.y_prepilot=np.array(prepilot_period[self.target_metric]),
+        self.y_pilot=np.array(pilot_period[self.target_metric])
+        
+        covariance = np.cov(self.y_prepilot, self.y_pilot)[0, 1]
+        
+        if is_ratio:
+            variance = self.delta_method(prepilot_period, self.id_field)["var_metric"]
+        else:
+            variance = np.var(self.y_prepilot)
         theta = covariance / variance
         return theta
 
@@ -387,8 +437,8 @@ class ABCore:
             .sort_values(self.sortmerge_list)
         )
         theta = self._calculate_theta(
-            y_prepilot=np.array(prepilot_period[self.target_metric]),
-            y_pilot=np.array(pilot_period[self.target_metric])
+            prepilot_period=prepilot_period,#np.array(prepilot_period[self.target_metric]),
+            pilot_period=pilot_period#np.array(pilot_period[self.target_metric])
             )
         res = pd.merge(
             prepilot_period,
@@ -421,7 +471,8 @@ class ABCore:
         self,
         pre_pilot_df: pd.DataFrame,
         pilot_df: pd.DataFrame,
-        all_groups: dict
+        all_groups: dict,
+        is_validation: bool = False
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
         Формирование и сортировка датафрейма для cuped'a
@@ -430,6 +481,7 @@ class ABCore:
             pre_pilot_df (pd.DataFrame): данные предпилотного периода
             pilot_df (pd.DataFrame): данные пилотного периода
             all_groups (dict): все юниты теста
+            is_validation (dict): период
 
         Returns:
             Tuple[pd.DataFrame, pd.DataFrame]: данные для cuped'a
@@ -440,13 +492,16 @@ class ABCore:
         # Все юниты в тесте и контроле
         all_units = functools.reduce(operator.iconcat, all_groups.values(), [])
         # Предпилотный период
-        dates_for_lin = sorted(list(set(pre_pilot_df[self.time_series_field].values)))[-self.cuped_time:]
+        if is_validation:
+            dates_for_lin = sorted(list(set(pre_pilot_df[self.time_series_field].values)))[-self.days_for_validation:]
+        else:
+            dates_for_lin = sorted(list(set(pre_pilot_df[self.time_series_field].values)))[-self.cuped_time:]
         pre_pilot_df = pre_pilot_df[
             pre_pilot_df[self.time_series_field].isin(dates_for_lin) & 
             pre_pilot_df[self.id_field].isin(all_units)
         ]    
-        pilot_df_sort = pilot_df.sort_values([self.id_field, "weekday"])
-        pre_pilot_df_sort = pre_pilot_df.sort_values([self.id_field, "weekday"])
+        pilot_df_sort = pilot_df.sort_values([self.id_field, self.time_series_field])
+        pre_pilot_df_sort = pre_pilot_df.sort_values([self.id_field, self.time_series_field])
         pilot_df_sort["row_number"] = [i for i in range(0, len(pilot_df_sort))]
         pre_pilot_df_sort["row_number"] = [i for i in range(0, len(pre_pilot_df_sort))]
         pilot_df_sort["period"] = "pilot"
@@ -468,7 +523,7 @@ class ABCore:
             method - метод поправки, default: 'holm', подробнее по ссылке
                 https://www.statsmodels.org/dev/generated/statsmodels.stats.multitest.multipletests.html
         """
-        decision, adj_pvals, sidak_aplha, bonf_alpha = stats.multitest.multipletests(
+        decision, adj_pvals, sidak_aplha, bonf_alpha = multipletests(
             pvals=list_of_pvals, alpha=alpha, method=method)
         return dict(
             decision=list(decision),
