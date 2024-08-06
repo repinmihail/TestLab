@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import seedir as sd
+import emoji
 
 
 from datetime import datetime, timedelta
@@ -10,7 +12,7 @@ from datetime import datetime, timedelta
 def _help_to_plot_series(
     series: int, series_name: str, metric_name: str, time_series_name: str, series_index = 0,
     start_line: str = None
-) -> None:
+):
     """
     Вспомогательный метод для отрисовки time-series графиков.
     """
@@ -23,7 +25,7 @@ def plot_time_series(
     *, df: pd.DataFrame, metric_name: str, grouped_column: str = None,
     time_series_name: str = 'date', start_line: str = None, exp_duration_in_days: int = 14,
     title: str = False, save_fig: bool = False, fig_name: str = None, **kwargs
-) -> None:
+):
     """
     Основной метод визуализации time-series данных.
 
@@ -61,3 +63,18 @@ def plot_time_series(
     if save_fig:
         plt.savefig(fig_name, **kwargs)
     plt.show()
+
+def get_directory_tree(path: str):
+    """
+    Возвращает структуру директории
+
+    Args:
+        path (str): путь директории,
+        kwargs (dict): аргументы seedir. Default = None
+    """
+    sd.seedir(
+        path,
+        first='folders',
+        style='emoji',
+        exclude_folders=["__pycache__", ".git"]
+    )
