@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import seedir as sd
+import emoji
 
 
 from datetime import datetime, timedelta
@@ -61,3 +63,18 @@ def plot_time_series(
     if save_fig:
         plt.savefig(fig_name, **kwargs)
     plt.show()
+
+def get_directory_tree(path: str):
+    """
+    Возвращает структуру директории
+
+    Args:
+        path (str): путь директории,
+        kwargs (dict): аргументы seedir. Default = None
+    """
+    sd.seedir(
+        path,
+        first='folders',
+        style='emoji',
+        exclude_folders=["__pycache__", ".git"]
+    )
